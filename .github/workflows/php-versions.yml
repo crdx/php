@@ -1,0 +1,76 @@
+name: Update
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  check-new-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.detect.outputs.versions }}
+    steps:
+      - name: Detect new PHP releases from php.net
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          MIN_MAJOR_VERSION=8
+
+          function fetch_php_net_versions {
+            curl -sS "https://www.php.net/releases/index.php?json" \
+              | jq -r 'to_entries[] | .value.version' \
+              | awk -F. -v min="$MIN_MAJOR_VERSION" '$1 >= min' \
+              | sort -V
+          }
+
+          function fetch_existing_releases {
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+              --json tagName --jq '.[].tagName | ltrimstr("v")' \
+              | sort -V
+          }
+
+          function to_json_array {
+            jq -R -s -c 'split("\n") | map(select(length > 0))'
+          }
+
+          # ————————————————————————————————————————————————————————————————————————————————————————
+          # Main
+          # ————————————————————————————————————————————————————————————————————————————————————————
+
+          fetch_php_net_versions > php_net_versions.txt
+          echo "Current php.net releases:"
+          cat php_net_versions.txt
+
+          fetch_existing_releases > existing_versions.txt
+          echo "Existing releases:"
+          cat existing_versions.txt
+
+          comm -23 php_net_versions.txt existing_versions.txt > new_versions.txt
+
+          if [ -s new_versions.txt ]; then
+            echo "New PHP versions to release:"
+            cat new_versions.txt
+            echo "versions=$(to_json_array < new_versions.txt)" >> "$GITHUB_OUTPUT"
+          else
+            echo "No new PHP versions found."
+            echo "versions=[]" >> "$GITHUB_OUTPUT"
+          fi
+
+  dispatch-releases:
+    needs: check-new-versions
+    runs-on: ubuntu-latest
+    if: needs.check-new-versions.outputs.versions != '[]'
+    strategy:
+      matrix:
+        version: ${{ fromJSON(needs.check-new-versions.outputs.versions) }}
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Dispatch release workflow for PHP ${{ matrix.version }}
+        uses: benc-uk/workflow-dispatch@7a027648b88c2413826b6ddd6c76114894dc5ec4  # v1.3.1
+        with:
+          workflow: php-release.yml
+          inputs: '{ "version": "${{ matrix.version }}" }'

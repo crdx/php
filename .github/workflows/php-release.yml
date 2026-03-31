@@ -1,0 +1,227 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'PHP version to release (e.g., 8.3.15)'
+        required: true
+        type: string
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate version format
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Error: Invalid version format '$VERSION'. Expected: X.Y.Z"
+            exit 1
+          fi
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+          - target: linux-aarch64
+            cross: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      EXTENSIONS: "bcmath,calendar,ctype,curl,dom,exif,fileinfo,filter,iconv,mbstring,mysqlnd,mysqli,openssl,pdo,pdo_mysql,pdo_sqlite,phar,readline,session,simplexml,sodium,sqlite3,tokenizer,xml,xmlwriter,zip,zlib"
+    steps:
+      - name: Download PHP source and verify GPG signature
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          DIST="https://www.php.net/distributions"
+
+          function download_source {
+            curl -fsSL -o "php-${VERSION}.tar.gz" "${DIST}/php-${VERSION}.tar.gz"
+            curl -fsSL -o "php-${VERSION}.tar.gz.asc" "${DIST}/php-${VERSION}.tar.gz.asc"
+          }
+
+          # https://www.php.net/gpg-keys.php
+          function import_signing_keys {
+            curl -fsSL "${DIST}/php-keyring.gpg" | gpg --import
+          }
+
+          function verify_signature {
+            gpg --verify "php-${VERSION}.tar.gz.asc" "php-${VERSION}.tar.gz"
+          }
+
+          function verify_tarball {
+            tar tzf "php-${VERSION}.tar.gz" > /dev/null
+          }
+
+          # ————————————————————————————————————————————————————————————————————————————————————————
+          # Main
+          # ————————————————————————————————————————————————————————————————————————————————————————
+
+          echo "Downloading PHP ${VERSION}..."
+          download_source
+
+          echo "Importing signing keys..."
+          import_signing_keys
+
+          echo "Verifying GPG signature..."
+          verify_signature
+
+          echo "Verifying tarball integrity..."
+          verify_tarball
+
+          echo "All checks passed."
+
+      - name: Install spc build tool
+        run: |
+          SPC_URL="https://github.com/crazywhalecc/static-php-cli/releases/latest/download"
+
+          echo "Downloading static-php-cli..."
+          curl -fsSL -o spc.tar.gz "${SPC_URL}/spc-linux-x86_64.tar.gz"
+          tar xzf spc.tar.gz
+          chmod +x spc
+          ./spc --version
+
+      - name: Set up QEMU for aarch64 cross-compilation
+        if: matrix.cross
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a  # v4.0.0
+        with:
+          platforms: arm64
+
+      - name: Build PHP from source
+        if: "!matrix.cross"
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          function spc_download_deps {
+            ./spc download --with-php="$VERSION" --for-extensions="$EXTENSIONS"
+          }
+
+          function spc_build {
+            ./spc build "$EXTENSIONS" --build-cli
+          }
+
+          # ————————————————————————————————————————————————————————————————————————————————————————
+          # Main
+          # ————————————————————————————————————————————————————————————————————————————————————————
+
+          echo "Building PHP ${VERSION}..."
+          ./spc doctor --auto-fix || true
+          spc_download_deps
+          spc_build
+
+      - name: Build PHP from source (aarch64 cross)
+        if: matrix.cross
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          SPC_URL="https://github.com/crazywhalecc/static-php-cli/releases/latest/download"
+
+          function install_qemu_userspace {
+            sudo apt-get update && sudo apt-get install -y qemu-user-static
+          }
+
+          function spc_download_deps {
+            ./spc download --with-php="$VERSION" --for-extensions="$EXTENSIONS"
+          }
+
+          function spc_build_cross {
+            SPC_USE_ARCH=aarch64 ./spc build "$EXTENSIONS" --build-cli
+          }
+
+          function install_spc_aarch64 {
+            curl -fsSL -o /tmp/spc.tar.gz "${SPC_URL}/spc-linux-aarch64.tar.gz"
+            tar xzf /tmp/spc.tar.gz -C /tmp
+            chmod +x /tmp/spc
+          }
+
+          function qemu_spc {
+            qemu-aarch64-static /tmp/spc "$@"
+          }
+
+          # ————————————————————————————————————————————————————————————————————————————————————————
+          # Main
+          # ————————————————————————————————————————————————————————————————————————————————————————
+
+          echo "Building PHP ${VERSION} for aarch64..."
+          install_qemu_userspace
+
+          ./spc doctor --auto-fix || true
+          spc_download_deps
+
+          if ! spc_build_cross; then
+            install_spc_aarch64
+            qemu_spc doctor --auto-fix || true
+            qemu_spc download --with-php="$VERSION" --for-extensions="$EXTENSIONS"
+            qemu_spc build "$EXTENSIONS" --build-cli
+          fi
+
+      - name: Package binary
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          ARCHIVE="php-${VERSION}-${TARGET}.tar.gz"
+
+          mkdir -p output
+          cp buildroot/bin/php output/php
+
+          cd output
+          tar czf "$ARCHIVE" php
+          rm php
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          cat "${ARCHIVE}.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
+        with:
+          name: php-${{ matrix.target }}
+          path: output/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Generate combined checksums
+        run: |
+          cd artifacts
+          cat *.sha256 > SHA256SUMS
+          echo "Combined checksums:"
+          cat SHA256SUMS
+
+      - name: Extract major version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          echo "VERSION_MAJOR=$(echo "$VERSION" | cut -d'.' -f1)" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe  # v2.6.1
+        with:
+          tag_name: "v${{ inputs.version }}"
+          draft: false
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+          body: |
+            [What's changed in v${{ inputs.version }}?](https://www.php.net/ChangeLog-${{ env.VERSION_MAJOR }}.php#${{ inputs.version }})
+
+            ## Usage (mise)
+
+            ```bash
+            mise use github:crdx/php@${{ inputs.version }}
+            ```
